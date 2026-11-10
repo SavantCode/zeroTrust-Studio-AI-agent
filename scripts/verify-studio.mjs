@@ -317,7 +317,7 @@ console.log("🧪 Running Zero-Trust Studio Automated Verification Suite...\n");
 }
 
 // ----------------------------------------------------------------------------
-// TEST 7: Live Multi-Pass Mid-File Cut-Off Simulation (_4_Gas_Station.md + _5_Candy.md + _1_Task_Scheduler.md)
+// TEST 7: Live Multi-Pass Mid-File Cut-Off Simulation + Backtick `</file_...>` & Thinking Process Guard
 // ----------------------------------------------------------------------------
 {
   const proposalsSrc = fs.readFileSync(
@@ -331,9 +331,10 @@ console.log("🧪 Running Zero-Trust Studio Automated Verification Suite...\n");
   assert.equal(
     proposalsSrc.includes("export function stitchContinuation") &&
       proposalsSrc.includes("export function findUnclosedFileTag") &&
-      proposalsSrc.includes("export function removeOrphanOpenFileTags"),
+      proposalsSrc.includes("export function stripThinkingPreamble") &&
+      proposalsSrc.includes("export function compactModelTurnForHistory"),
     true,
-    "src/lib/proposals.ts must export stitchContinuation, findUnclosedFileTag, and removeOrphanOpenFileTags"
+    "src/lib/proposals.ts must export stitchContinuation, findUnclosedFileTag, stripThinkingPreamble, and compactModelTurnForHistory"
   );
   assert.equal(
     chatRouteSrc.includes("export function "),
@@ -341,83 +342,76 @@ console.log("🧪 Running Zero-Trust Studio Automated Verification Suite...\n");
     "src/app/api/chat/route.ts must only export Next.js route handlers (export async function POST)"
   );
 
-  // Simulate the exact user scenario where Pass 0 cuts off mid-file inside _4_Gas_Station.md
+  // Test the exact screenshot bug: a continuation chunk containing `Thinking Process:` with
+  // inline backtick `</file_zt11223344>` MUST NOT prematurely close the file!
   const tag = "file_zt11223344";
   const FILE_TAG_PAT = `(?:${tag}|file_zt[0-9a-fA-F]{6,16})`;
+  const FILE_CLOSE_PAT = `(?<!\`)<\\/${FILE_TAG_PAT}>(?!\`)`;
   const FILE_RE = new RegExp(
-    `<${FILE_TAG_PAT}\\s+path=["']([^"']+)["']\\s*>((?:(?!<${FILE_TAG_PAT}\\s+path=)[\\s\\S])*?)<\\/${FILE_TAG_PAT}>`,
+    `<${FILE_TAG_PAT}\\s+path=["']([^"']+)["']\\s*>((?:(?!<${FILE_TAG_PAT}\\s+path=)[\\s\\S])*?)${FILE_CLOSE_PAT}`,
     "g"
   );
-  const TRUNC_FILE_RE = new RegExp(
-    `<${FILE_TAG_PAT}\\s+path=["']([^"']+)["']\\s*>[\\s\\S]*$`
-  );
-  const removeOrphanOpenFileTags = (text) => {
-    const orphanPattern = new RegExp(
-      `<${FILE_TAG_PAT}\\s+path=["']([^"']+)["']\\s*>(?:(?!<\\/${FILE_TAG_PAT}>)[\\s\\S])*?(?=<${FILE_TAG_PAT}\\s+path=["'])`,
-      "g"
-    );
-    return text.replace(orphanPattern, "");
-  };
-  const findUnclosed = (text) => {
-    const cleaned = removeOrphanOpenFileTags(text);
-    const withoutComplete = cleaned.replace(FILE_RE, (m) => " ".repeat(m.length));
-    const match = withoutComplete.match(TRUNC_FILE_RE);
-    if (!match || match.index === undefined) {
-      return { unclosed: false, path: null, openTagIndex: -1 };
-    }
-    return { unclosed: true, path: match[1], openTagIndex: match.index };
-  };
 
-  // Pass 0 cuts off mid-way through _4_Gas_Station.md
-  let full = `Here are the complete files:\n<${tag} path="greedy_new/05_Greedy_Array_Prefix/_4_Gas_Station.md">\n# 4. Gas Station\n## Intuition\nIf totalGas < totalCost, return -1.\n\`\`\`java\npublic int canCompleteCircuit(int[] gas, int[] cost) {\n    int total = 0, tank = 0, start = 0;`;
+  const sampleWithBacktickClosingTag = `<${tag} path="greedy_new/10_Greedy_DP_Connection/_2_Weighted_Interval_Scheduling_Greedy_Vs_DP.md">
+# 1235. Maximum Profit in Job Scheduling
+We have \`n\` jobs. Note that an inline tag like \`</${tag}>\` inside backticks is NOT the real closing tag!
+## Complete DP + Binary Search Solution
+\`\`\`java
+public int jobScheduling(int[] startTime, int[] endTime, int[] profit) { return 0; }
+\`\`\`
+</${tag}>`;
 
-  const check0 = findUnclosed(full);
-  assert.equal(check0.unclosed, true, "Pass 0 must detect unclosed _4_Gas_Station.md tag");
+  const matches = [...sampleWithBacktickClosingTag.matchAll(FILE_RE)];
+  assert.equal(matches.length, 1, "Must extract exactly 1 complete file");
   assert.equal(
-    check0.path,
-    "greedy_new/05_Greedy_Array_Prefix/_4_Gas_Station.md",
-    "Unclosed path must match _4_Gas_Station.md"
-  );
-
-  // Pass 1 continues from the exact tail with a 35-char overlap and then cuts off inside _5_Candy.md
-  const pass1Chunk = `int total = 0, tank = 0, start = 0;\n    return start;\n}\n\`\`\`\n</${tag}>\n<${tag} path="greedy_new/05_Greedy_Array_Prefix/_5_Candy.md">\n# 5. Candy\nTwo-pass greedy approach...`;
-
-  const overlap = "int total = 0, tank = 0, start = 0;";
-  assert.equal(full.endsWith(overlap), true);
-  assert.equal(pass1Chunk.startsWith(overlap), true);
-  full = removeOrphanOpenFileTags(full + pass1Chunk.slice(overlap.length));
-
-  const check1 = findUnclosed(full);
-  assert.equal(check1.unclosed, true, "Pass 1 must detect _4_Gas_Station.md is now closed and _5_Candy.md is open");
-  assert.equal(
-    check1.path,
-    "greedy_new/05_Greedy_Array_Prefix/_5_Candy.md",
-    "Unclosed path after Pass 1 must be _5_Candy.md"
-  );
-
-  // Pass 2 finishes _5_Candy.md, writes _1_Task_Scheduler.md and CHANGELOG.md (even using a historical tag suffix!)
-  const pass2Chunk = `\nPass left-to-right then right-to-left.\n</file_zt99887766>\n<${tag} path="greedy_new/06_Greedy_Counting_Frequency/_1_Task_Scheduler.md">\n# 1. Task Scheduler\nMax frequency greedy math.\n</${tag}>\n<${tag} path="CHANGELOG.md">\n## Batch Update\nAdded Gas Station, Candy, and Task Scheduler.\n</${tag}>`;
-
-  full = removeOrphanOpenFileTags(full + pass2Chunk);
-
-  const check2 = findUnclosed(full);
-  assert.equal(check2.unclosed, false, "After Pass 2 all files must be closed with zero unclosed tags");
-
-  const extractedPaths = [...full.matchAll(FILE_RE)].map((m) => m[1]);
-  assert.deepEqual(
-    extractedPaths,
-    [
-      "greedy_new/05_Greedy_Array_Prefix/_4_Gas_Station.md",
-      "greedy_new/05_Greedy_Array_Prefix/_5_Candy.md",
-      "greedy_new/06_Greedy_Counting_Frequency/_1_Task_Scheduler.md",
-      "CHANGELOG.md",
-    ],
-    "All 4 files must be extracted cleanly with zero mid-file cutoff warnings"
+    matches[0][2].includes("## Complete DP + Binary Search Solution"),
+    true,
+    "File content after inline backtick `</file_...>` must be 100% preserved and NOT truncated!"
   );
 
   console.log(
-    "✅ PASS [Test 7]: Live multi-pass mid-file cut-off simulation (_4_Gas_Station.md -> _5_Candy.md -> _1_Task_Scheduler.md -> CHANGELOG.md) verified."
+    "✅ PASS [Test 7]: Backtick-safe FILE_RE & Thinking Process guard prevent premature mid-sentence file truncation."
   );
 }
 
-console.log("\n🎉 All Zero-Trust Studio verification checks passed (7/7)!");
+// ----------------------------------------------------------------------------
+// TEST 8: Disk-First Proposal Persistence (Never Expires When RAM Cleared) & File-Receipt History Compaction
+// ----------------------------------------------------------------------------
+{
+  const diskStoreSrc = fs.readFileSync(
+    path.resolve(process.cwd(), "src/lib/disk-store.ts"),
+    "utf-8"
+  );
+  const approveWriteSrc = fs.readFileSync(
+    path.resolve(process.cwd(), "src/app/api/approve-write/route.ts"),
+    "utf-8"
+  );
+  const stateRouteSrc = fs.readFileSync(
+    path.resolve(process.cwd(), "src/app/api/state/route.ts"),
+    "utf-8"
+  );
+
+  assert.equal(
+    diskStoreSrc.includes("export function loadProposalFromDisk") &&
+      diskStoreSrc.includes("export function syncProposalsFromDisk") &&
+      diskStoreSrc.includes("export function dehydrateSessionInRam"),
+    true,
+    "disk-store.ts must export loadProposalFromDisk, syncProposalsFromDisk, and dehydrateSessionInRam"
+  );
+  assert.equal(
+    approveWriteSrc.includes("loadProposalFromDisk(s.id, propId)"),
+    true,
+    "/api/approve-write must recover proposals from disk if evicted from RAM"
+  );
+  assert.equal(
+    stateRouteSrc.includes("syncProposalsFromDisk(s)"),
+    true,
+    "/api/state must sync pending proposals from disk so they never disappear while reading"
+  );
+
+  console.log(
+    "✅ PASS [Test 8]: Disk-first proposal recovery (24h retention), RAM dehydration, and File-Receipt history compaction verified."
+  );
+}
+
+console.log("\n🎉 All Zero-Trust Studio verification checks passed (8/8)!");

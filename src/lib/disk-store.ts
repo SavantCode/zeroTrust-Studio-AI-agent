@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { SESSION_TTL_MS } from "./config";
-import { cleanForDisplay } from "./proposals";
+import { cleanForDisplay, compactModelTurnForHistory } from "./proposals";
 import type {
   BuilderSession,
   CommandProposal,
@@ -285,8 +285,18 @@ function reconcileDisplayAndHistory(
   history: HistoryTurn[],
   fallbackTs: number
 ): { display: DisplayMessage[]; history: HistoryTurn[] } {
+  // Compact any legacy bulky <file_...> bodies in loaded history so RAM is immediately freed!
+  const compactedHistory = history.map((h) =>
+    h.role === "model"
+      ? {
+          role: "model" as const,
+          parts: [{ text: compactModelTurnForHistory(h.parts?.[0]?.text || "") }],
+        }
+      : h
+  );
+
   // Case 1: history.jsonl has turns, but display.jsonl is missing or shorter -> reconstruct display
-  if (history.length > 0 && display.length === 0) {
+  if (compactedHistory.length > 0 && display.length === 0) {
     const rebuiltDisplay: DisplayMessage[] = [];
     for (let i = 0; i < history.length; i++) {
       const h = history[i];
@@ -308,11 +318,11 @@ function reconcileDisplayAndHistory(
         });
       }
     }
-    return { display: rebuiltDisplay, history };
+    return { display: rebuiltDisplay, history: compactedHistory };
   }
 
   // Case 2: display.jsonl has messages, but history.jsonl is missing -> reconstruct history
-  if (display.length > 0 && history.length === 0) {
+  if (display.length > 0 && compactedHistory.length === 0) {
     const rebuiltHistory: HistoryTurn[] = display.map((d) => ({
       role: d.role,
       parts: [{ text: d.text }],
@@ -320,7 +330,7 @@ function reconcileDisplayAndHistory(
     return { display, history: rebuiltHistory };
   }
 
-  return { display, history };
+  return { display, history: compactedHistory };
 }
 
 // ============================================================================
@@ -358,6 +368,112 @@ export function saveProposalToDisk(sid: string, p: FileProposal): void {
       path.join(propsDir, `${p.id}.json`),
       JSON.stringify(record)
     );
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Loads a single proposal record from `.zt-storage/sessions/<sid>/proposals/<propId>.json`
+ * and hydrates its content from `.zt-storage/blobs/`.
+ * Guarantees that even if a worker's RAM was cleared or reloaded while the user spent
+ * 15–60+ minutes reading the diff, clicking Approve/Deny NEVER fails with "Proposal expired".
+ */
+export function loadProposalFromDisk(
+  sid: string,
+  propId: string
+): FileProposal | null {
+  try {
+    if (!propId || /[^a-zA-Z0-9_-]/.test(propId)) return null;
+    const propFile = path.join(sessionDir(sid), "proposals", `${propId}.json`);
+    const rec = readJsonFileSafe<DiskProposalRecord>(propFile);
+    if (!rec) return null;
+    const prop: FileProposal = {
+      id: rec.id,
+      kind: rec.kind,
+      relPath: rec.relPath,
+      content: getBlob(rec.contentHash) ?? undefined,
+      contentHash: rec.contentHash,
+      oldContent: getBlob(rec.oldContentHash),
+      oldContentHash: rec.oldContentHash,
+      turn: rec.turn,
+      baseHash: rec.baseHash,
+      action: rec.action,
+      needsNewFolder: rec.needsNewFolder,
+      folderToCreate: rec.folderToCreate,
+      isCritical: rec.isCritical,
+      criticalReason: rec.criticalReason,
+    };
+    return prop;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Syncs any proposals stored on disk (`.zt-storage/sessions/<sid>/proposals/*.json`)
+ * into `s.pendingChanges` as lightweight hash pointers (without holding bulky strings in RAM).
+ */
+export function syncProposalsFromDisk(s: BuilderSession): void {
+  try {
+    const propsDir = path.join(sessionDir(s.id), "proposals");
+    if (!fs.existsSync(propsDir)) return;
+    for (const f of fs.readdirSync(propsDir)) {
+      if (!f.endsWith(".json")) continue;
+      const pid = f.slice(0, -5);
+      if (s.pendingChanges[pid]) continue;
+      const rec = readJsonFileSafe<DiskProposalRecord>(path.join(propsDir, f));
+      if (!rec) continue;
+      s.pendingChanges[rec.id] = {
+        id: rec.id,
+        kind: rec.kind,
+        relPath: rec.relPath,
+        content: undefined, // Keep RAM free; hydrated on demand via hydrateProposal()
+        contentHash: rec.contentHash,
+        oldContent: null,
+        oldContentHash: rec.oldContentHash,
+        turn: rec.turn,
+        baseHash: rec.baseHash,
+        action: rec.action,
+        needsNewFolder: rec.needsNewFolder,
+        folderToCreate: rec.folderToCreate,
+        isCritical: rec.isCritical,
+        criticalReason: rec.criticalReason,
+      };
+    }
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Releases bulky file content strings from Node.js RAM after they have been safely persisted
+ * to `.zt-storage/blobs/<sha1>.blob` on disk.
+ */
+export function dehydrateSessionInRam(s: BuilderSession): void {
+  try {
+    for (const p of Object.values(s.pendingChanges)) {
+      if (!p.contentHash && p.content !== undefined) {
+        p.contentHash = putBlob(p.content);
+      }
+      if (!p.oldContentHash && p.oldContent !== null) {
+        p.oldContentHash = putBlob(p.oldContent);
+      }
+      if (p.contentHash) {
+        p.content = undefined;
+      }
+      if (p.oldContentHash) {
+        p.oldContent = null;
+      }
+    }
+    if (s.snapshot && s.snapshot.text) {
+      if (!s.snapshot.textHash) {
+        s.snapshot.textHash = putBlob(s.snapshot.text) || undefined;
+      }
+      if (s.snapshot.textHash) {
+        s.snapshot.text = "";
+      }
+    }
   } catch {
     // ignore
   }
@@ -645,27 +761,19 @@ export function saveSessionToDisk(s: BuilderSession): void {
     saveSnapshotToDisk(s.id, s.snapshot);
     saveUndoStackToDisk(s.id, s.undoStack);
 
-    // Sync proposals folder (and remove any stale proposal JSON files)
+    // Persist any in-memory proposals to disk, and sync any existing disk proposals into RAM.
+    // CRITICAL FIX: NEVER unlink `proposals/*.json` here based on in-memory `s.pendingChanges`,
+    // because another worker or hot-reloaded route may have a stale `s.pendingChanges` map while
+    // the user is spending 15–60 minutes reading the proposed files!
+    // Proposals are ONLY deleted from disk by explicit `deleteProposalFromDisk` or `clearSessionProposalsOnDisk`.
     const propsDir = path.join(dir, "proposals");
     fs.mkdirSync(propsDir, { recursive: true });
-    const activePropIds = new Set(Object.keys(s.pendingChanges));
     for (const p of Object.values(s.pendingChanges)) {
       saveProposalToDisk(s.id, p);
     }
-    for (const f of fs.readdirSync(propsDir)) {
-      if (f.endsWith(".json")) {
-        const pid = f.slice(0, -5);
-        if (!activePropIds.has(pid)) {
-          try {
-            fs.unlinkSync(path.join(propsDir, f));
-          } catch {
-            // ignore
-          }
-        }
-      }
-    }
+    syncProposalsFromDisk(s);
 
-    // Sync checkpoints folder (and remove any evicted or cleared checkpoint JSON files)
+    // Sync checkpoints folder
     const cpDir = path.join(dir, "checkpoints");
     fs.mkdirSync(cpDir, { recursive: true });
     const activeCpIds = new Set((s.checkpoints || []).map((c) => c.id));
@@ -675,14 +783,16 @@ export function saveSessionToDisk(s: BuilderSession): void {
         saveCheckpointToDisk(s.id, cp);
       }
     }
-    for (const f of fs.readdirSync(cpDir)) {
-      if (f.endsWith(".json")) {
-        const cid = f.slice(0, -5);
-        if (!activeCpIds.has(cid)) {
-          try {
-            fs.unlinkSync(path.join(cpDir, f));
-          } catch {
-            // ignore
+    if (s.checkpoints && s.checkpoints.length > 0) {
+      for (const f of fs.readdirSync(cpDir)) {
+        if (f.endsWith(".json")) {
+          const cid = f.slice(0, -5);
+          if (!activeCpIds.has(cid)) {
+            try {
+              fs.unlinkSync(path.join(cpDir, f));
+            } catch {
+              // ignore
+            }
           }
         }
       }
@@ -725,21 +835,21 @@ export function loadSessionFromDisk(sid: string): BuilderSession | null {
       lastSeen
     );
 
+    // Keep snapshot text dehydrated in RAM (`text: ""`) until `/api/chat` actually needs it!
     let snapshot: SnapshotData | null = null;
     const snapPath = path.join(dir, "snapshot.json");
     const sr = readJsonFileSafe<DiskSnapshotRecord>(snapPath);
-    if (sr) {
-      const snapText = getBlob(sr.textHash);
-      if (snapText !== null) {
-        snapshot = {
-          text: snapText,
-          textHash: sr.textHash || undefined,
-          count: sr.count,
-          omitted: sr.omitted || [],
-        };
-      }
+    if (sr && sr.textHash) {
+      snapshot = {
+        text: "",
+        textHash: sr.textHash,
+        count: sr.count,
+        omitted: sr.omitted || [],
+      };
     }
 
+    // Keep proposals dehydrated in RAM (`content: undefined`, `oldContent: null`)
+    // so Node.js RAM stays completely free until the user views or approves them!
     const pendingChanges: Record<string, FileProposal> = {};
     const propsDir = path.join(dir, "proposals");
     if (fs.existsSync(propsDir)) {
@@ -753,9 +863,9 @@ export function loadSessionFromDisk(sid: string): BuilderSession | null {
           id: rec.id,
           kind: rec.kind,
           relPath: rec.relPath,
-          content: getBlob(rec.contentHash) ?? undefined,
+          content: undefined,
           contentHash: rec.contentHash,
-          oldContent: getBlob(rec.oldContentHash),
+          oldContent: null,
           oldContentHash: rec.oldContentHash,
           turn: rec.turn,
           baseHash: rec.baseHash,
@@ -1079,7 +1189,9 @@ export function purgeExpiredDiskSessionsAndOrphanBlobs(
       }
     }
 
-    // Sweep unreferenced blobs (immediately if manual GC, or >5 mins old for background sweep)
+    // Sweep unreferenced blobs ONLY when manually triggered (`forceOrphanSweep`)
+    // OR when the blob is older than the full 24-hour SESSION_TTL_MS window!
+    // This guarantees pending proposals and versions can NEVER be deleted while the user is reading them.
     if (fs.existsSync(BLOBS_DIR)) {
       for (const bf of fs.readdirSync(BLOBS_DIR)) {
         if (!bf.endsWith(".blob")) continue;
@@ -1088,7 +1200,7 @@ export function purgeExpiredDiskSessionsAndOrphanBlobs(
           const fullBlob = path.join(BLOBS_DIR, bf);
           try {
             const st = fs.statSync(fullBlob);
-            if (forceOrphanSweep || now - st.mtimeMs > 5 * 60 * 1000) {
+            if (forceOrphanSweep || now - st.mtimeMs >= SESSION_TTL_MS) {
               freedBytes += st.size;
               fs.unlinkSync(fullBlob);
               removedBlobs++;

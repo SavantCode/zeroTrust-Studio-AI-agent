@@ -23,6 +23,7 @@ import {
   deleteProposalFromDisk,
   getStorageStats,
   hydrateProposal,
+  loadProposalFromDisk,
   putBlob,
 } from "@/lib/disk-store";
 
@@ -31,7 +32,18 @@ export async function POST(req: NextRequest) {
   const { session: s, error, status } = getOrCreateSession(req, body.sid);
   if (!s) return NextResponse.json({ error }, { status: status || 400 });
 
-  const rawProp = s.pendingChanges[body.id];
+  const propId = String(body.id || "");
+  // Disk-first fallback: if this worker's RAM doesn't have `propId` (e.g. after reading for 15+ mins
+  // or across Next.js route workers), load it directly from `.zt-storage/sessions/<sid>/proposals/`!
+  let rawProp = s.pendingChanges[propId];
+  if (!rawProp && propId) {
+    const fromDisk = loadProposalFromDisk(s.id, propId);
+    if (fromDisk) {
+      rawProp = fromDisk;
+      s.pendingChanges[propId] = fromDisk;
+    }
+  }
+
   if (!rawProp) {
     return NextResponse.json(
       { error: "Proposal expired or not found." },

@@ -6,6 +6,7 @@ import {
   getStorageStats,
   hydrateProposal,
   listStoredSessions,
+  syncProposalsFromDisk,
 } from "@/lib/disk-store";
 
 export async function GET(req: NextRequest) {
@@ -16,6 +17,9 @@ export async function GET(req: NextRequest) {
   );
   if (!s) return NextResponse.json({ error }, { status: status || 400 });
 
+  // Always sync any pending proposals from `.zt-storage/sessions/<sid>/proposals/` on disk
+  // and hydrate a clone for the UI response while keeping RAM dehydrated!
+  syncProposalsFromDisk(s);
   const proposals = Object.values(s.pendingChanges).map((p) =>
     hydrateProposal({ ...p })
   );
