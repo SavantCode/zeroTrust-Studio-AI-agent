@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import fs from "fs";
+import path from "path";
 import { GoogleGenAI } from "@google/genai";
 import {
   getOrCreateSession,
@@ -25,28 +26,35 @@ import {
   ctxInfo,
   estChars,
   isBinaryBuffer,
+  walk,
 } from "@/lib/workspace";
 import { safeResolve } from "@/lib/security";
 import {
   buildSystemPrompt,
   cleanForDisplay,
+  compactModelTurnForHistory,
   extractProposals,
   findUnclosedFileTag,
   NEXT_RE,
   stitchContinuation,
+  stripThinkingPreamble,
 } from "@/lib/proposals";
 import {
   appendChatTurnToDisk,
+  dehydrateSessionInRam,
   getBlob,
   getStorageStats,
+  hydrateProposal,
   putBlob,
   saveAttachmentToDisk,
   saveProposalToDisk,
   saveSnapshotToDisk,
+  syncProposalsFromDisk,
 } from "@/lib/disk-store";
 import type {
   AttachmentMeta,
   AttachmentPayload,
+  BuilderSession,
   ChatMode,
   HistoryTurn,
   OperationChip,
@@ -57,9 +65,6 @@ export const maxDuration = 300;
 
 function createVertexClient(workspaceRoot?: string | null): GoogleGenAI {
   const authCfg = resolveVertexAuthOptions(workspaceRoot);
-  // Temporarily mask GOOGLE_API_KEY / GEMINI_API_KEY during GoogleGenAI construction
-  // when Service Account credentials are used so @google/genai does not log
-  // "The user provided Google Cloud credentials will take precedence over the API key..."
   const savedGoogleApiKey = process.env.GOOGLE_API_KEY;
   const savedGeminiApiKey = process.env.GEMINI_API_KEY;
   if (authCfg.googleAuthOptions) {
@@ -86,33 +91,70 @@ function createVertexClient(workspaceRoot?: string | null): GoogleGenAI {
 }
 
 /**
- * Rewrites any historical `<file_zt...>`, `<delete_zt...>`, `<cmd_zt...>`, `<next_zt...>` tags
- * in loaded session history to match the current process `TAG_KEY` so the AI never sees
- * conflicting tag suffixes after a server restart.
+ * Extracts only visible non-thought text from a `@google/genai` stream chunk.
+ * Prevents internal `part.thought === true` reasoning parts from leaking into file contents!
  */
-function unifyHistoryTagKeys(text: string): string {
-  return text
-    .replace(/(<\/?)file_zt[0-9a-fA-F]{6,16}\b/g, `$1${TF}`)
-    .replace(/(<\/?)delete_zt[0-9a-fA-F]{6,16}\b/g, `$1${TD}`)
-    .replace(/(<\/?)cmd_zt[0-9a-fA-F]{6,16}\b/g, `$1${TC}`)
-    .replace(/(<\/?)next_zt[0-9a-fA-F]{6,16}\b/g, `$1${TN}`);
+function extractVisibleChunkText(chunk: unknown): string {
+  const c = chunk as {
+    text?: string;
+    candidates?: Array<{
+      content?: {
+        parts?: Array<{ text?: string; thought?: boolean }>;
+      };
+    }>;
+  };
+  const parts = c?.candidates?.[0]?.content?.parts;
+  if (Array.isArray(parts) && parts.length > 0) {
+    let out = "";
+    for (const part of parts) {
+      if (part && part.thought === true) continue;
+      if (typeof part?.text === "string") {
+        out += part.text;
+      }
+    }
+    return out;
+  }
+  return typeof c?.text === "string" ? c.text : "";
 }
 
-// Normalize history into strict user->model pairs so corrupted JSONL never misaligns roles
-function normalizeTurnPairs(history: HistoryTurn[]): HistoryTurn[] {
+/**
+ * Rewrites any historical `<file_zt...>`, `<delete_zt...>`, `<cmd_zt...>`, `<next_zt...>` tags
+ * in loaded session history to match the current process `TAG_KEY` AND compacts bulky `<file_...>`
+ * bodies into lightweight File Receipts so old turns never waste tokens or RAM.
+ */
+function normalizeAndCompactTurnPairs(history: HistoryTurn[]): HistoryTurn[] {
+  const unifyTags = (text: string) =>
+    text
+      .replace(/(<\/?)file_zt[0-9a-fA-F]{6,16}\b/g, `$1${TF}`)
+      .replace(/(<\/?)delete_zt[0-9a-fA-F]{6,16}\b/g, `$1${TD}`)
+      .replace(/(<\/?)cmd_zt[0-9a-fA-F]{6,16}\b/g, `$1${TC}`)
+      .replace(/(<\/?)next_zt[0-9a-fA-F]{6,16}\b/g, `$1${TN}`);
+
   const pairs: HistoryTurn[] = [];
   for (let i = 0; i < history.length; i++) {
     const cur = history[i];
     const next = history[i + 1];
     if (cur && cur.role === "user" && next && next.role === "model") {
+      // Strip bulky snapshot/delta/pinned preamble from older user turns in history so we only keep
+      // the user's actual request and concise event context in history
+      const rawUser = unifyTags(cur.parts?.[0]?.text || "");
+      const reqIdx = rawUser.indexOf("=== USER REQUEST");
+      const compactUser =
+        reqIdx > 0
+          ? rawUser.slice(0, Math.min(reqIdx, 600)) + "\n" + rawUser.slice(reqIdx)
+          : rawUser;
+
+      const rawModel = unifyTags(next.parts?.[0]?.text || "");
+      const compactModel = compactModelTurnForHistory(rawModel);
+
       pairs.push(
         {
           role: "user",
-          parts: [{ text: unifyHistoryTagKeys(cur.parts?.[0]?.text || "") }],
+          parts: [{ text: compactUser }],
         },
         {
           role: "model",
-          parts: [{ text: unifyHistoryTagKeys(next.parts?.[0]?.text || "") }],
+          parts: [{ text: compactModel }],
         }
       );
       i++;
@@ -121,15 +163,23 @@ function normalizeTurnPairs(history: HistoryTurn[]): HistoryTurn[] {
   return pairs;
 }
 
-// Sliding-Window Context Compaction: keep 100% of messages on disk for 24h,
-// but send a compacted summary of older turns + the last 6 full turns (12 messages) to Gemini.
+/**
+ * Cache-Friendly 4-Turn Block Compaction:
+ * Instead of shifting the sliding window by 1 turn on every message (which invalidates Vertex AI's
+ * 75% Context Cache prefix on every turn), we compact older turns in stable 4-turn (8-message) blocks!
+ */
 function buildCompactedHistory(rawHistory: HistoryTurn[]): HistoryTurn[] {
-  const history = normalizeTurnPairs(rawHistory);
-  const MAX_RECENT_MESSAGES = 12; // 6 full user+model turns
-  if (history.length <= MAX_RECENT_MESSAGES) return history;
+  const history = normalizeAndCompactTurnPairs(rawHistory);
+  const totalTurns = Math.floor(history.length / 2);
+  if (totalTurns <= 8) return history;
 
-  const older = history.slice(0, history.length - MAX_RECENT_MESSAGES);
-  const recent = history.slice(history.length - MAX_RECENT_MESSAGES);
+  // Keep the most recent 6–9 turns intact and summarize older turns in fixed 4-turn blocks
+  const compactedTurnCount = Math.floor((totalTurns - 6) / 4) * 4;
+  if (compactedTurnCount <= 0) return history;
+
+  const olderMsgCount = compactedTurnCount * 2;
+  const older = history.slice(0, olderMsgCount);
+  const recent = history.slice(olderMsgCount);
 
   const summaryLines: string[] = [];
   for (let i = 0; i < older.length; i += 2) {
@@ -137,9 +187,9 @@ function buildCompactedHistory(rawHistory: HistoryTurn[]): HistoryTurn[] {
     const m = older[i + 1]?.parts?.[0]?.text || "";
     const reqMatch = u.match(/=== USER REQUEST[\s\S]*?===\n([\s\S]*?)(\n\n|$)/);
     const shortUser = (reqMatch ? reqMatch[1] : u).trim().slice(0, 220);
-    const shortModel = cleanForDisplay(m).slice(0, 280);
+    const shortModel = m.trim().slice(0, 360);
     summaryLines.push(
-      `Turn #${Math.floor(i / 2) + 1}:\n- User: ${shortUser}\n- AI Summary: ${shortModel}`
+      `Turn #${Math.floor(i / 2) + 1}:\n- User: ${shortUser}\n- AI Outcome: ${shortModel}`
     );
   }
 
@@ -148,7 +198,7 @@ function buildCompactedHistory(rawHistory: HistoryTurn[]): HistoryTurn[] {
       role: "user",
       parts: [
         {
-          text: `=== COMPACTED ARCHITECTURAL MEMORY OF EARLIER TURNS (1 to ${Math.floor(older.length / 2)}) ===\n${summaryLines.join("\n\n")}`,
+          text: `=== COMPACTED ARCHITECTURAL & FILE LEDGER OF EARLIER TURNS (1 to ${compactedTurnCount}) ===\n${summaryLines.join("\n\n")}`,
         },
       ],
     },
@@ -156,12 +206,129 @@ function buildCompactedHistory(rawHistory: HistoryTurn[]): HistoryTurn[] {
       role: "model",
       parts: [
         {
-          text: "Understood. I have reviewed the compacted summary of earlier turns and will maintain full continuity with the recent turns and current workspace snapshot.",
+          text: "Understood. I have reviewed the compacted file ledger of earlier turns and will maintain full continuity with the recent turns and current workspace files.",
         },
       ],
     },
     ...recent,
   ];
+}
+
+/**
+ * Builds:
+ * 1. A compact live Workspace File Tree with byte sizes (so the AI knows all files & immediately sees any tiny stub files).
+ * 2. Automatic On-Demand File Content blocks for any workspace file mentioned in `prompt` (even without `@`)!
+ * 3. Previous version content from `s.undoStack` (`.zt-storage/blobs/`) if the user asks to compare/restore an earlier version.
+ * 4. Currently unapproved pending proposals from `.zt-storage/sessions/<sid>/proposals/`.
+ */
+function buildOnDemandCodebaseContext(
+  s: BuilderSession,
+  prompt: string,
+  alreadyPinnedPaths: Set<string>
+): string {
+  if (!s.root || s.readDenied) return "";
+  const { files } = walk(s.root);
+  files.sort((a, b) => a.rel.localeCompare(b.rel));
+
+  const blocks: string[] = [];
+
+  // 1. Live Workspace File Tree with byte sizes (~150 tokens)
+  const treeLines = files.map((f) => {
+    const stubFlag =
+      f.size > 0 && f.size < 900 && f.rel.endsWith(".md")
+        ? ` ⚠️ [SHORT/INCOMPLETE STUB: ${f.size} bytes]`
+        : ` (${f.size} bytes)`;
+    return `- ${f.rel}${stubFlag}`;
+  });
+  if (treeLines.length > 0) {
+    blocks.push(
+      `=== LIVE WORKSPACE FILE TREE (${files.length} files on disk) ===\n${treeLines.join("\n")}`
+    );
+  }
+
+  // 2. Automatic Filename Detection in User Prompt (without needing `@`)
+  const promptLower = prompt.toLowerCase();
+  const wantsPrevVersion =
+    /\b(previous|older|earlier|prior|before|revert|restore|history|version)\b/i.test(
+      prompt
+    );
+
+  let autoLoadedBytes = 0;
+  const MAX_AUTO_LOAD_BYTES = 120_000;
+
+  for (const f of files) {
+    if (alreadyPinnedPaths.has(f.rel)) continue;
+    const baseName = path.basename(f.rel);
+    const stem = baseName.replace(/\.[^.]+$/, "");
+    // Match if the prompt mentions the relative path, the exact filename, or a distinctive stem (>= 5 chars)
+    const matched =
+      promptLower.includes(f.rel.toLowerCase()) ||
+      promptLower.includes(baseName.toLowerCase()) ||
+      (stem.length >= 5 && promptLower.includes(stem.toLowerCase()));
+
+    if (matched && autoLoadedBytes + f.size <= MAX_AUTO_LOAD_BYTES) {
+      try {
+        const buf = fs.readFileSync(f.full);
+        if (!isBinaryBuffer(buf)) {
+          const content = buf.toString("utf-8");
+          autoLoadedBytes += content.length;
+          blocks.push(
+            `--- AUTO-LOADED WORKSPACE FILE (referenced in prompt): ${f.rel} (${f.size} bytes) ---\n${content}`
+          );
+
+          // 3. If the user asked about a previous version of this file, also load its latest backup from s.undoStack
+          if (wantsPrevVersion) {
+            const undoEntry = [...s.undoStack]
+              .reverse()
+              .find((u) => u.rel === f.rel && (u.prevHash || u.prev));
+            if (undoEntry) {
+              const prevContent =
+                undoEntry.prev ?? getBlob(undoEntry.prevHash ?? null);
+              if (prevContent) {
+                blocks.push(
+                  `--- PREVIOUS VERSION FROM UNDO HISTORY (.zt-storage/blobs): ${f.rel} ---\n${prevContent.slice(0, 30_000)}`
+                );
+              }
+            }
+          }
+        }
+      } catch {
+        // ignore unreadable
+      }
+    }
+  }
+
+  // 4. Attach any unapproved pending proposals (hydrated from disk on demand) if the user references them
+  syncProposalsFromDisk(s);
+  const pendingList = Object.values(s.pendingChanges);
+  if (pendingList.length > 0) {
+    const pendingSummary = pendingList
+      .map((p) => `- ${p.relPath} (${p.action}, Turn #${p.turn})`)
+      .join("\n");
+    blocks.push(
+      `=== UNAPPROVED PENDING PROPOSALS WAITING FOR USER REVIEW ===\n${pendingSummary}`
+    );
+    for (const rawP of pendingList) {
+      const base = path.basename(rawP.relPath).toLowerCase();
+      if (
+        promptLower.includes(rawP.relPath.toLowerCase()) ||
+        promptLower.includes(base)
+      ) {
+        const hydrated = hydrateProposal({ ...rawP });
+        if (
+          hydrated.content &&
+          autoLoadedBytes + hydrated.content.length <= MAX_AUTO_LOAD_BYTES
+        ) {
+          autoLoadedBytes += hydrated.content.length;
+          blocks.push(
+            `--- PENDING UNAPPROVED PROPOSAL CONTENT: ${hydrated.relPath} ---\n${hydrated.content}`
+          );
+        }
+      }
+    }
+  }
+
+  return blocks.join("\n\n");
 }
 
 export async function POST(req: NextRequest) {
@@ -268,7 +435,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Empty prompt." }, { status: 400 });
   }
 
-  // Extract @file mentions from prompt and pin their exact fresh content
+  // Extract explicit @file mentions from prompt and pin their exact fresh content
   const pinnedBlocks: string[] = [];
   const mentionMatches = [...prompt.matchAll(/@([A-Za-z0-9_./-\[\]]+)/g)];
   const seenMentions = new Set<string>();
@@ -284,6 +451,7 @@ export async function POST(req: NextRequest) {
           const buf = fs.readFileSync(resolved);
           if (!isBinaryBuffer(buf)) {
             const content = buf.toString("utf-8");
+            seenMentions.add(rel);
             pinnedBlocks.push(`--- PINNED @FILE: ${rel} ---\n${content}\n`);
           }
         }
@@ -321,6 +489,7 @@ export async function POST(req: NextRequest) {
   const prevEvents = [...s.events];
 
   const delta = s.readDenied || refreshed ? null : buildDelta(s);
+  const onDemandContext = buildOnDemandCodebaseContext(s, prompt, seenMentions);
   const ev = s.events.splice(0);
   let turnCommitted = false;
 
@@ -334,14 +503,15 @@ export async function POST(req: NextRequest) {
     chatMode === "talk"
       ? `(ACTIVE MODE: 💬 TALK / ARCHITECTURE PLANNING MODE. Discuss architecture, answer questions, or design an implementation plan. Use \`\`\`mermaid\`\`\` diagrams when illustrating architecture or flows. Do NOT emit file write/delete/cmd tags in this turn.)`
       : askBeforeCritical
-        ? `(ACTIVE MODE: 🔨 BUILD MODE with Critical Confirmation Gate ON. If this request requires deleting existing files or making unconfirmed breaking architectural changes to core config/routing/schemas, explain the impact and ask for confirmation first. Otherwise, propose the full file changes and update CHANGELOG.md.)`
-        : `(ACTIVE MODE: 🔨 BUILD MODE. Propose all required file changes and update CHANGELOG.md.)`;
+        ? `(ACTIVE MODE: 🔨 BUILD MODE with Critical Confirmation Gate ON. Write every requested file to 100% completion—never output short stubs. For CHANGELOG.md, output ONLY the new ## section.)`
+        : `(ACTIVE MODE: 🔨 BUILD MODE. Write every requested file to 100% completion—never output short stubs. For CHANGELOG.md, output ONLY the new ## section.)`;
 
   const userText =
     (ev.length
       ? `=== USER ACTIONS & COMMAND OUTPUTS SINCE LAST MESSAGE ===\n${ev.join("\n")}\n\n`
       : "") +
     (delta ? `${delta}\n\n` : "") +
+    (onDemandContext ? `${onDemandContext}\n\n` : "") +
     (pinnedBlocks.length
       ? `=== PINNED WORKSPACE FILES (@MENTIONED BY USER) ===\n${pinnedBlocks.join("\n")}\n\n`
       : "") +
@@ -414,7 +584,7 @@ export async function POST(req: NextRequest) {
         });
 
         for await (const chunk of stream) {
-          const t = chunk.text;
+          const t = extractVisibleChunkText(chunk);
           if (t) {
             passText += t;
             onDelta?.(t);
@@ -434,7 +604,7 @@ export async function POST(req: NextRequest) {
         }
 
         return {
-          text: passText,
+          text: stripThinkingPreamble(passText),
           promptTokens,
           outputTokens,
           cachedTokens,
@@ -449,7 +619,7 @@ export async function POST(req: NextRequest) {
         // return the partial text so the auto-continuation loop can seamlessly resume it!
         if (passText.length > 200) {
           return {
-            text: passText,
+            text: stripThinkingPreamble(passText),
             promptTokens,
             outputTokens,
             cachedTokens,
@@ -471,7 +641,6 @@ export async function POST(req: NextRequest) {
             errStr
           )
         ) {
-          // Step down to the next lower tokenCap in tokenBudgetsToTry
           continue;
         }
         throw err;
@@ -538,8 +707,8 @@ export async function POST(req: NextRequest) {
 
           const tailContext = full.slice(-1200);
           const continueInstruction = truncCheck.unclosed
-            ? `SYSTEM AUTO-CONTINUE (Pass ${pass}/${MAX_CONTINUATION_PASSES}): Your response stopped mid-file inside <${TF} path="${truncCheck.path}"> right at the end of this excerpt:\n<<<TAIL_START>>>\n${tailContext}\n<<<TAIL_END>>>\n\nCRITICAL INSTRUCTIONS:\n1. Continue writing from the EXACT character immediately after <<<TAIL_END>>>.\n2. Do NOT repeat the text inside <<<TAIL_START>>>...<<<TAIL_END>>> and do NOT re-open <${TF} path="${truncCheck.path}">.\n3. Finish writing the rest of "${truncCheck.path}", close it with </${TF}>, and then output any remaining requested <${TF} path="...">...</${TF}> files and CHANGELOG.md.`
-            : `SYSTEM AUTO-CONTINUE (Pass ${pass}/${MAX_CONTINUATION_PASSES}): Your response hit the output token limit right at the end of this excerpt:\n<<<TAIL_START>>>\n${tailContext}\n<<<TAIL_END>>>\n\nContinue seamlessly from the exact character immediately after <<<TAIL_END>>> without repeating any already-completed text or files.`;
+            ? `SYSTEM AUTO-CONTINUE (Pass ${pass}/${MAX_CONTINUATION_PASSES}): Your response stopped mid-file inside <${TF} path="${truncCheck.path}"> right at the end of this excerpt:\n<<<TAIL_START>>>\n${tailContext}\n<<<TAIL_END>>>\n\nCRITICAL INSTRUCTIONS:\n1. Output ONLY the raw continuation characters starting immediately after <<<TAIL_END>>>.\n2. Do NOT output "Thinking Process:", commentary, or markdown fences around your continuation, and do NOT re-open <${TF} path="${truncCheck.path}">.\n3. Finish writing the rest of "${truncCheck.path}", close it with </${TF}> on its own line, and then output any remaining requested <${TF} path="...">...</${TF}> files and CHANGELOG.md.`
+            : `SYSTEM AUTO-CONTINUE (Pass ${pass}/${MAX_CONTINUATION_PASSES}): Your response hit the output token limit right at the end of this excerpt:\n<<<TAIL_START>>>\n${tailContext}\n<<<TAIL_END>>>\n\nContinue seamlessly from the exact character immediately after <<<TAIL_END>>> without outputting "Thinking Process:" or repeating already-completed text.`;
 
           const contContents = [
             ...contents,
@@ -611,18 +780,23 @@ export async function POST(req: NextRequest) {
           .filter(Boolean)
           .slice(0, 3);
 
-        const histText =
-          userText +
+        // Store compact user request + File-Receipt model summary in `s.history` & `history.jsonl`
+        // so we never waste tokens or RAM storing 10,000-byte raw <file_...> bodies in history!
+        const compactHistUserText =
+          (ev.length ? `Events:\n${ev.join("\n")}\n\n` : "") +
+          `=== USER REQUEST [MODE: ${chatMode.toUpperCase()}] ===\n${prompt}` +
           (attachmentMetas.length
-            ? `\n[The user attached ${attachmentMetas.length} file(s)/media: ${attachmentMetas.map((a) => a.name).join(", ")}]`
+            ? `\n[Attached ${attachmentMetas.length} file(s): ${attachmentMetas.map((a) => a.name).join(", ")}]`
             : "");
+        const compactHistModelText = compactModelTurnForHistory(full);
+
         const userHist: HistoryTurn = {
           role: "user",
-          parts: [{ text: histText }],
+          parts: [{ text: compactHistUserText }],
         };
         const modelHist: HistoryTurn = {
           role: "model",
-          parts: [{ text: full }],
+          parts: [{ text: compactHistModelText }],
         };
         s.history.push(userHist, modelHist);
         turnCommitted = true;
@@ -688,9 +862,8 @@ export async function POST(req: NextRequest) {
           s.usage.cached += s.usage.last.cached;
         }
 
-        // Persist metadata/logs only (do NOT rewrite display.jsonl & history.jsonl on top of appendChatTurnToDisk)
-        persistSessionDebounced(s.id, false);
-
+        // Send hydrated proposals to the client in `{ t: "done" }` FIRST,
+        // and then dehydrate `s.pendingChanges` & `s.snapshot.text` in RAM so Node.js RAM stays completely free!
         send({
           t: "done",
           text: clean,
@@ -707,6 +880,9 @@ export async function POST(req: NextRequest) {
           storage: getStorageStats(),
           userAttachments: attachmentMetas,
         });
+
+        dehydrateSessionInRam(s);
+        persistSessionDebounced(s.id, false);
       } catch (e: unknown) {
         rollbackDeltaAndEvents();
         let msg = e instanceof Error ? e.message : String(e);
