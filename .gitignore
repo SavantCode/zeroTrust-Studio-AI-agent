@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js / Build outputs
+.next/
+out/
+build/
+dist/
+coverage/
+
+# Zero-Trust Studio local storage
+.zt-storage/
+.zt-session-store/
+
+# Strict Secret & Credential Protection (NEVER commit to Git/GitHub)
+vertex_credentials.json
+vertex_credentials*.json
+.env
+.env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+!.env.example
+!.env.sample
+!.env.template
+
+# Debug & OS files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+*.pem
+*.tsbuildinfo
