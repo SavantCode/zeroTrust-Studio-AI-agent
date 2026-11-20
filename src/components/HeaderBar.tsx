@@ -39,6 +39,9 @@ interface AuthHealthInfo {
   maskedClientEmail: string | null;
   validPemKey: boolean;
   pemError?: string | null;
+  dnsReachable?: boolean;
+  dnsAddress?: string | null;
+  dnsError?: string | null;
   hint: string;
 }
 
@@ -600,7 +603,7 @@ export default function HeaderBar({
               if (next) await fetchAuthStatus(true);
             }}
             className={`px-2 py-1 rounded font-mono text-[11px] border flex items-center gap-1 transition-colors ${
-              authInfo?.configured
+              authInfo?.configured && authInfo.dnsReachable !== false
                 ? "bg-emerald-950/60 border-emerald-500/50 text-emerald-300 hover:bg-emerald-900/50"
                 : "bg-amber-950/60 border-amber-500/50 text-amber-300 hover:bg-amber-900/50"
             }`}
@@ -610,15 +613,23 @@ export default function HeaderBar({
                 : "Vertex AI Credentials Missing or Invalid — Click to inspect .env status"
             }
           >
-            <span>{authInfo?.configured ? "🔑" : "⚠️"}</span>
             <span>
-              {authInfo?.configured
-                ? authInfo.source === "key-file"
-                  ? "JSON Ready"
-                  : ".env Ready"
-                : authInfo?.source !== "missing" && authInfo && !authInfo.validPemKey
-                  ? "Invalid Key"
-                  : "Auth Missing"}
+              {authInfo?.configured && authInfo.dnsReachable !== false
+                ? "🔑"
+                : "⚠️"}
+            </span>
+            <span>
+              {authInfo?.dnsReachable === false
+                ? "DNS Offline"
+                : authInfo?.configured
+                  ? authInfo.source === "key-file"
+                    ? "JSON Ready"
+                    : ".env Ready"
+                  : authInfo?.source !== "missing" &&
+                      authInfo &&
+                      !authInfo.validPemKey
+                    ? "Invalid Key"
+                    : "Auth Missing"}
             </span>
           </button>
 
@@ -640,16 +651,18 @@ export default function HeaderBar({
                 <div className="space-y-1.5 text-[11px] font-mono">
                   <div
                     className={`p-2 rounded border ${
-                      authInfo.configured
+                      authInfo.configured && authInfo.dnsReachable !== false
                         ? "bg-emerald-950/40 border-emerald-500/40 text-emerald-200"
                         : "bg-rose-950/40 border-rose-500/40 text-rose-200"
                     }`}
                   >
-                    {authInfo.configured
-                      ? "✅ Service Account Authenticated"
-                      : authInfo.pemError
-                        ? "❌ Invalid Private Key (OpenSSL Decoder)"
-                        : "❌ Credentials Not Configured"}
+                    {authInfo.dnsReachable === false
+                      ? "❌ Network / DNS Unreachable (ENOTFOUND)"
+                      : authInfo.configured
+                        ? "✅ Service Account Authenticated"
+                        : authInfo.pemError
+                          ? "❌ Invalid Private Key (OpenSSL Decoder)"
+                          : "❌ Credentials Not Configured"}
                   </div>
                   <div className="bg-slate-950 border border-slate-800 rounded p-2 space-y-1 text-slate-300">
                     <div className="flex justify-between gap-2">
@@ -682,9 +695,28 @@ export default function HeaderBar({
                           : "⚠️ Failed Decode"}
                       </span>
                     </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-slate-500">Google OAuth DNS:</span>
+                      <span
+                        className={
+                          authInfo.dnsReachable === false
+                            ? "text-rose-400"
+                            : "text-emerald-300"
+                        }
+                      >
+                        {authInfo.dnsReachable === false
+                          ? "❌ ENOTFOUND"
+                          : `✅ ${authInfo.dnsAddress || "Resolved"}`}
+                      </span>
+                    </div>
                     {authInfo.pemError && (
                       <div className="text-[10px] text-rose-300 bg-rose-950/40 border border-rose-500/30 rounded p-1.5 break-words">
                         {authInfo.pemError}
+                      </div>
+                    )}
+                    {authInfo.dnsError && (
+                      <div className="text-[10px] text-rose-300 bg-rose-950/40 border border-rose-500/30 rounded p-1.5 break-words">
+                        {authInfo.dnsError}
                       </div>
                     )}
                   </div>
@@ -704,8 +736,8 @@ export default function HeaderBar({
                 className="w-full bg-emerald-600/30 hover:bg-emerald-600/50 border border-emerald-500/40 text-emerald-200 py-1.5 rounded text-xs font-medium"
               >
                 {authChecking
-                  ? "↻ Reloading .env…"
-                  : "↻ Reload .env & Verify Now"}
+                  ? "↻ Reloading .env & DNS…"
+                  : "↻ Reload .env & Test DNS Now"}
               </button>
             </div>
           )}

@@ -1,7 +1,16 @@
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import dns from "dns";
 import dotenv from "dotenv";
+
+// Prefer IPv4 first to prevent Node.js v18-v22 dual-stack IPv6 getaddrinfo ENOTFOUND
+// failures on Windows / ISP routers when contacting oauth2.googleapis.com
+try {
+  dns.setDefaultResultOrder("ipv4first");
+} catch {
+  // ignore if unsupported in environment
+}
 
 // Ensure .env / .env.local are loaded in all server contexts
 dotenv.config({ path: path.resolve(process.cwd(), ".env.local") });
@@ -38,6 +47,9 @@ export interface VertexAuthHealthStatus {
   maskedClientEmail: string | null;
   validPemKey: boolean;
   pemError?: string | null;
+  dnsReachable?: boolean;
+  dnsAddress?: string | null;
+  dnsError?: string | null;
   hint: string;
 }
 
@@ -53,6 +65,62 @@ function stripSurroundingQuotes(val: string): string {
     t = t.slice(1, -1).trim();
   }
   return t;
+}
+
+function sanitizeHttpsUrl(rawUrl: string | undefined, fallbackUrl: string): string {
+  const cleaned = stripSurroundingQuotes(rawUrl || "")
+    .replace(/^["'`]+|["'`,;\s]+$/g, "")
+    .trim();
+  if (!cleaned) return fallbackUrl;
+  try {
+    const parsed = new URL(cleaned);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      return fallbackUrl;
+    }
+    if (!parsed.hostname || parsed.hostname.includes(" ")) {
+      return fallbackUrl;
+    }
+    return parsed.toString();
+  } catch {
+    return fallbackUrl;
+  }
+}
+
+/**
+ * Verifies OS DNS resolution for `oauth2.googleapis.com` so the Studio can distinguish
+ * credential issues from local DNS / internet / VPN outages (`getaddrinfo ENOTFOUND`).
+ */
+export async function checkVertexDnsReachability(): Promise<{
+  reachable: boolean;
+  address: string | null;
+  error: string | null;
+}> {
+  try {
+    const res = await dns.promises.lookup("oauth2.googleapis.com", {
+      family: 4,
+    });
+    return {
+      reachable: true,
+      address: res.address,
+      error: null,
+    };
+  } catch {
+    try {
+      const fallback = await dns.promises.lookup("oauth2.googleapis.com");
+      return {
+        reachable: true,
+        address: fallback.address,
+        error: null,
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        reachable: false,
+        address: null,
+        error: msg,
+      };
+    }
+  }
 }
 
 /**
@@ -288,16 +356,18 @@ export function resolveVertexAuthOptions(workspaceRoot?: string | null): {
       client_email: envClientEmail,
       client_id:
         stripSurroundingQuotes(process.env.GOOGLE_CLIENT_ID || "") || undefined,
-      auth_uri:
-        stripSurroundingQuotes(process.env.GOOGLE_AUTH_URI || "") ||
-        "https://accounts.google.com/o/oauth2/auth",
-      token_uri:
-        stripSurroundingQuotes(process.env.GOOGLE_TOKEN_URI || "") ||
-        "https://oauth2.googleapis.com/token",
-      auth_provider_x509_cert_url:
-        stripSurroundingQuotes(
-          process.env.GOOGLE_AUTH_PROVIDER_X509_CERT_URL || ""
-        ) || "https://www.googleapis.com/oauth2/v1/certs",
+      auth_uri: sanitizeHttpsUrl(
+        process.env.GOOGLE_AUTH_URI,
+        "https://accounts.google.com/o/oauth2/auth"
+      ),
+      token_uri: sanitizeHttpsUrl(
+        process.env.GOOGLE_TOKEN_URI,
+        "https://oauth2.googleapis.com/token"
+      ),
+      auth_provider_x509_cert_url: sanitizeHttpsUrl(
+        process.env.GOOGLE_AUTH_PROVIDER_X509_CERT_URL,
+        "https://www.googleapis.com/oauth2/v1/certs"
+      ),
       client_x509_cert_url:
         stripSurroundingQuotes(
           process.env.GOOGLE_CLIENT_X509_CERT_URL || ""
@@ -350,6 +420,10 @@ export function resolveVertexAuthOptions(workspaceRoot?: string | null): {
           parsed.private_key
         );
         parsed.private_key = keyValidation.pem;
+        parsed.token_uri = sanitizeHttpsUrl(
+          parsed.token_uri,
+          "https://oauth2.googleapis.com/token"
+        );
         const proj = parsed.project_id || envProjectId;
         if (keyValidation.valid) {
           return {
@@ -424,6 +498,10 @@ export function resolveVertexAuthOptions(workspaceRoot?: string | null): {
             parsed.private_key
           );
           parsed.private_key = keyValidation.pem;
+          parsed.token_uri = sanitizeHttpsUrl(
+            parsed.token_uri,
+            "https://oauth2.googleapis.com/token"
+          );
           const proj =
             stripSurroundingQuotes(
               process.env.GCP_PROJECT || process.env.GOOGLE_PROJECT_ID || ""
