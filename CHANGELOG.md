@@ -1,9 +1,11 @@
-## v3.2.0 — Comprehensive `README.md`, `.env.example` Template & `problems_faced/` Engineering Case Study
+## v3.4.0 — Fix Mid-Stream `TypeError: terminated` Cutoff (~90s) via Seamless Auto-Continuation & Stream Heartbeats
 
 ### What Changed
-1. **Created `.env.example`**:
-   - Added a complete, documented template of all required and optional environment variables (`GOOGLE_TYPE`, `GOOGLE_PROJECT_ID`, `GOOGLE_PRIVATE_KEY_ID`, `GOOGLE_PRIVATE_KEY`, `GOOGLE_CLIENT_EMAIL`, `GOOGLE_CLIENT_ID`, `GOOGLE_AUTH_URI`, `GOOGLE_TOKEN_URI`, `GOOGLE_AUTH_PROVIDER_X509_CERT_URL`, `GOOGLE_CLIENT_X509_CERT_URL`, `GOOGLE_UNIVERSE_DOMAIN`, `GOOGLE_SERVICE_ACCOUNT_JSON`, `GOOGLE_APPLICATION_CREDENTIALS`, `GCP_PROJECT`, `GCP_LOCATION`, `MODEL`, `PORT`, `CONTEXT_CHAR_BUDGET`, `MAX_OUTPUT_TOKENS`).
-2. **Updated `README.md`**:
-   - Documented the full Zero-Trust AI Studio architecture (with Mermaid system diagram), step-by-step installation and startup guide, environment variable reference table, complete feature breakdown, under-the-hood lifecycle, and verification suite summary.
-3. **Created `problems_faced/` Engineering Case Study (`problems_faced/README.md` & `problems_faced/01_Storage_RAM_And_Token_Optimization_Case_Study.md`)**:
-   - Detailed the 4 real-world production challenges encountered during 14+ turn sessions (94k+ prompt token explosion & cache misses, Node.js RAM bloat, `"Proposal expired or not found"` across workers, and `Thinking Process: ... close \`</file_zt...>\`` mid-file truncation) and how the **3-Tier Smart Memory Architecture** resolved each one.
+1. **Zero-Loss Mid-Stream `terminated` Recovery (`src/app/api/chat/route.ts`)**:
+   - Fixed the issue where long-running Vertex AI streams (~60–90s) that threw Node Undici's `TypeError: terminated` aborted the turn and displayed `"terminated"`.
+   - Any stream interrupted after emitting visible text (`passText.trim().length > 0`) now returns `finishReason: "INTERRUPTED"`, refreshes the `GoogleGenAI` client pool, and seamlessly hands off to the **Tail-Append Auto-Continuation Engine** (`<<<TAIL_START>>>...<<<TAIL_END>>>`) for up to 8 continuation passes.
+   - Added `terminated`, `UND_ERR_`, `other side closed`, `502/503/504`, `UNAVAILABLE`, and `DEADLINE_EXCEEDED` to `TRANSIENT_STREAM_ERROR_RE` so pre-text thinking-phase drops automatically retry up to 3 times with exponential backoff.
+   - Wrapped continuation passes in an inner `try/catch` so a late continuation network error gracefully preserves and commits all already-generated content and file proposals instead of crashing the turn.
+   - Added a 15-second `{ t: "hb" }` keep-alive heartbeat over the NDJSON response stream.
+2. **Updated `problems_faced/02_Vertex_Auth_OpenSSL_PEM_And_DNS_Resilience_Case_Study.md` & `problems_faced/README.md`**:
+   - Added Challenge 3 documenting the `POST /api/chat 200 in 90623ms` `TypeError: terminated` root cause and auto-continuation recovery architecture.

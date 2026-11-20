@@ -63,6 +63,18 @@ import type {
 // Allow long-running streaming generations up to 5 minutes without route timeout
 export const maxDuration = 300;
 
+const TRANSIENT_STREAM_ERROR_RE =
+  /terminated|UND_ERR_|other side closed|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|EPIPE|socket hang up|fetch failed|network error|502|503|504|UNAVAILABLE|INTERNAL|DEADLINE_EXCEEDED/i;
+
+function formatErrorWithCause(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const cause = (err as Error & { cause?: unknown }).cause;
+  if (cause instanceof Error && cause.message && !err.message.includes(cause.message)) {
+    return `${err.message} (${cause.message})`;
+  }
+  return err.message;
+}
+
 function createVertexClient(workspaceRoot?: string | null): GoogleGenAI {
   const authCfg = resolveVertexAuthOptions(workspaceRoot);
   const savedGoogleApiKey = process.env.GOOGLE_API_KEY;
@@ -543,7 +555,7 @@ export async function POST(req: NextRequest) {
   const encoder = new TextEncoder();
   const sysInstruction = buildSystemPrompt(chatMode, askBeforeCritical);
   const authHealth = getVertexAuthHealthStatus(s.root, false);
-  const ai = createVertexClient(s.root);
+  let ai = createVertexClient(s.root);
 
   // Cascade through highest-supported output token budgets so models capped at 32k/16k/8k
   // still use their maximum capacity instead of dropping to a tiny default limit.
@@ -564,8 +576,10 @@ export async function POST(req: NextRequest) {
   }> => {
     let activeModel = selectedModel;
     let lastError: unknown = null;
+    let streamRetryCount = 0;
 
-    for (const tokenCap of tokenBudgetsToTry) {
+    for (let bIdx = 0; bIdx < tokenBudgetsToTry.length; bIdx++) {
+      const tokenCap = tokenBudgetsToTry[bIdx];
       let passText = "";
       let promptTokens = 0;
       let outputTokens = 0;
@@ -615,9 +629,14 @@ export async function POST(req: NextRequest) {
         lastError = err;
         if (ac.signal.aborted) throw err;
 
-        // If we already received substantial text before a mid-stream network/timeout glitch,
-        // return the partial text so the auto-continuation loop can seamlessly resume it!
-        if (passText.length > 200) {
+        const errStr = formatErrorWithCause(err);
+
+        // CRITICAL RECOVERY: If Undici or the SSE socket closed mid-stream (e.g. `TypeError: terminated`
+        // at ~60-90s) after ANY visible text was already emitted, NEVER discard `passText`!
+        // Return it with `finishReason: "INTERRUPTED"` so the auto-continuation engine seamlessly
+        // resumes from the exact character where the stream terminated.
+        if (passText.trim().length > 0) {
+          ai = createVertexClient(s.root);
           return {
             text: stripThinkingPreamble(passText),
             promptTokens,
@@ -628,7 +647,17 @@ export async function POST(req: NextRequest) {
           };
         }
 
-        const errStr = err instanceof Error ? err.message : String(err);
+        // If `passText` is still empty (e.g. `TypeError: terminated`, `ENOTFOUND`, `ECONNRESET`, or `503`
+        // happened while the model was still in its internal thinking phase or opening the stream),
+        // re-initialize the Vertex client pool and retry up to 3 times with backoff.
+        if (TRANSIENT_STREAM_ERROR_RE.test(errStr) && streamRetryCount < 3) {
+          streamRetryCount++;
+          ai = createVertexClient(s.root);
+          await new Promise((r) => setTimeout(r, 800 * streamRetryCount));
+          bIdx--; // retry same tokenCap
+          continue;
+        }
+
         if (
           activeModel !== MODEL &&
           (errStr.includes("404") || errStr.includes("NOT_FOUND"))
@@ -660,6 +689,14 @@ export async function POST(req: NextRequest) {
         }
       };
 
+      // Send a lightweight heartbeat every 15s while waiting on long model thinking phases
+      // so the browser / local HTTP proxy never closes the response stream prematurely.
+      const heartbeatTimer = setInterval(() => {
+        if (!ac.signal.aborted) {
+          send({ t: "hb", ts: Date.now() });
+        }
+      }, 15_000);
+
       try {
         send({
           t: "meta",
@@ -688,27 +725,30 @@ export async function POST(req: NextRequest) {
         let totalCachedTokens = initialPass.cachedTokens;
         let lastFinishReason = initialPass.finishReason;
 
-        // SEAMLESS TAIL-APPEND AUTO-CONTINUATION (Up to 5 passes):
-        // Never discard already-generated partial file content! Instead, keep `full` intact,
-        // feed the exact tail context to the model, and stitch the continuation seamlessly.
-        const MAX_CONTINUATION_PASSES = 5;
+        // SEAMLESS TAIL-APPEND AUTO-CONTINUATION (Up to 8 passes):
+        // Never discard already-generated partial file content or mid-sentence text when a stream hits
+        // MAX_TOKENS or Undici's ~90s `TypeError: terminated`! Keep `full` intact, feed the exact tail
+        // context to the model, and stitch the continuation seamlessly.
+        const MAX_CONTINUATION_PASSES = 8;
+        let consecutiveContErrors = 0;
+
         for (let pass = 1; pass <= MAX_CONTINUATION_PASSES; pass++) {
           if (ac.signal.aborted) break;
 
           const truncCheck = findUnclosedFileTag(full);
-          const hitTokenCap =
+          const hitTokenCapOrInterrupted =
             lastFinishReason === "MAX_TOKENS" ||
             lastFinishReason === "LENGTH" ||
             lastFinishReason === "INTERRUPTED";
 
-          if (!truncCheck.unclosed && !hitTokenCap) {
+          if (!truncCheck.unclosed && !hitTokenCapOrInterrupted) {
             break;
           }
 
           const tailContext = full.slice(-1200);
           const continueInstruction = truncCheck.unclosed
             ? `SYSTEM AUTO-CONTINUE (Pass ${pass}/${MAX_CONTINUATION_PASSES}): Your response stopped mid-file inside <${TF} path="${truncCheck.path}"> right at the end of this excerpt:\n<<<TAIL_START>>>\n${tailContext}\n<<<TAIL_END>>>\n\nCRITICAL INSTRUCTIONS:\n1. Output ONLY the raw continuation characters starting immediately after <<<TAIL_END>>>.\n2. Do NOT output "Thinking Process:", commentary, or markdown fences around your continuation, and do NOT re-open <${TF} path="${truncCheck.path}">.\n3. Finish writing the rest of "${truncCheck.path}", close it with </${TF}> on its own line, and then output any remaining requested <${TF} path="...">...</${TF}> files and CHANGELOG.md.`
-            : `SYSTEM AUTO-CONTINUE (Pass ${pass}/${MAX_CONTINUATION_PASSES}): Your response hit the output token limit right at the end of this excerpt:\n<<<TAIL_START>>>\n${tailContext}\n<<<TAIL_END>>>\n\nContinue seamlessly from the exact character immediately after <<<TAIL_END>>> without outputting "Thinking Process:" or repeating already-completed text.`;
+            : `SYSTEM AUTO-CONTINUE (Pass ${pass}/${MAX_CONTINUATION_PASSES}): Your stream was interrupted or hit the output token limit right at the end of this excerpt:\n<<<TAIL_START>>>\n${tailContext}\n<<<TAIL_END>>>\n\nContinue seamlessly from the exact character immediately after <<<TAIL_END>>> without outputting "Thinking Process:" or repeating already-completed text.`;
 
           const contContents = [
             ...contents,
@@ -722,34 +762,47 @@ export async function POST(req: NextRequest) {
             },
           ];
 
-          const contPass = await runStreamPass(contContents);
-          totalPromptTokens = contPass.promptTokens || totalPromptTokens;
-          totalOutputTokens += contPass.outputTokens;
-          totalCachedTokens = Math.max(
-            totalCachedTokens,
-            contPass.cachedTokens
-          );
-          lastFinishReason = contPass.finishReason;
+          try {
+            const contPass = await runStreamPass(contContents);
+            consecutiveContErrors = 0;
 
-          if (!contPass.text.trim()) {
-            break;
-          }
+            totalPromptTokens = contPass.promptTokens || totalPromptTokens;
+            totalOutputTokens += contPass.outputTokens;
+            totalCachedTokens = Math.max(
+              totalCachedTokens,
+              contPass.cachedTokens
+            );
+            lastFinishReason = contPass.finishReason;
 
-          const { merged, appendedDelta } = stitchContinuation(
-            full,
-            contPass.text,
-            truncCheck,
-            TF
-          );
+            if (!contPass.text.trim()) {
+              break;
+            }
 
-          // Guard against zero forward progress
-          if (merged.length <= full.length) {
-            break;
-          }
+            const { merged, appendedDelta } = stitchContinuation(
+              full,
+              contPass.text,
+              truncCheck,
+              TF
+            );
 
-          full = merged;
-          if (appendedDelta) {
-            send({ t: "d", x: appendedDelta });
+            // Guard against zero forward progress
+            if (merged.length <= full.length) {
+              break;
+            }
+
+            full = merged;
+            if (appendedDelta) {
+              send({ t: "d", x: appendedDelta });
+            }
+          } catch (contErr: unknown) {
+            if (ac.signal.aborted) throw contErr;
+            consecutiveContErrors++;
+            ai = createVertexClient(s.root);
+            // Try one more continuation attempt if a continuation pass had a network glitch;
+            // if it still fails, break gracefully so we preserve `full` instead of crashing the turn!
+            if (consecutiveContErrors >= 2) {
+              break;
+            }
           }
         }
 
@@ -885,7 +938,7 @@ export async function POST(req: NextRequest) {
         persistSessionDebounced(s.id, false);
       } catch (e: unknown) {
         rollbackDeltaAndEvents();
-        let msg = e instanceof Error ? e.message : String(e);
+        let msg = formatErrorWithCause(e);
         if (/Could not load the default credentials/i.test(msg)) {
           msg +=
             " — Copy `.env.example` to `.env` and fill in your GOOGLE_CLIENT_EMAIL, GOOGLE_PRIVATE_KEY, and GOOGLE_PROJECT_ID (or place `vertex_credentials.json` in the project root).";
@@ -894,9 +947,16 @@ export async function POST(req: NextRequest) {
         ) {
           msg =
             "OpenSSL failed to decode GOOGLE_PRIVATE_KEY (`error:1E08010C:DECODER routines::unsupported`). Please check `GOOGLE_PRIVATE_KEY` in your `.env` file and ensure the full RSA key between `-----BEGIN PRIVATE KEY-----` and `-----END PRIVATE KEY-----` is intact, then click the 🔑 badge in the top bar -> 'Reload .env & Verify Now'.";
+        } else if (
+          /getaddrinfo ENOTFOUND|EAI_AGAIN/i.test(msg)
+        ) {
+          msg = `Network / DNS Resolution Error (${msg}): Your credentials are valid, but Node.js could not resolve Google's OAuth/Vertex host (oauth2.googleapis.com). Please check your internet connection, VPN/proxy, or set your system DNS to 8.8.8.8 / 1.1.1.1, then try again.`;
+        } else if (/^terminated\b/i.test(msg)) {
+          msg = `Vertex AI stream connection was closed prematurely by the remote server (${msg}) after multiple retry attempts. Please click Send / Retry to continue.`;
         }
         send({ t: "error", error: msg });
       } finally {
+        clearInterval(heartbeatTimer);
         s.busy = false;
         s.abort = null;
         try {
